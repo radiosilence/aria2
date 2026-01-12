@@ -1,0 +1,121 @@
+name: macos
+
+on:
+  push:
+    tags:
+      - 'release-*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string for the build (e.g., 1.37.0)'
+        required: false
+        default: 'dev'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: amd64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Determine version
+      id: version
+      run: |
+        if [[ "${{ github.event_name }}" == "push" && "${{ github.ref_type }}" == "tag" ]]; then
+          VERSION="${GITHUB_REF_NAME#release-}"
+        elif [[ -n "${{ github.event.inputs.version }}" && "${{ github.event.inputs.version }}" != "dev" ]]; then
+          VERSION="${{ github.event.inputs.version }}"
+        else
+          VERSION="dev-$(git rev-parse --short HEAD)"
+        fi
+        echo "version=${VERSION}" >> $GITHUB_OUTPUT
+        echo "Building version: ${VERSION}"
+
+    - name: Install dependencies
+      run: |
+        brew install \
+          cppunit \
+          gettext \
+          openssl@3 \
+          libssh2 \
+          c-ares \
+          sqlite3 \
+          autoconf \
+          automake \
+          pkg-config \
+          libtool
+
+    - name: Setup environment
+      run: |
+        echo 'CC=clang' >> $GITHUB_ENV
+        echo 'CXX=clang++' >> $GITHUB_ENV
+        echo "$(brew --prefix gettext)/bin" >> $GITHUB_PATH
+        PKG_CONFIG_PATH="$(brew --prefix openssl@3)/lib/pkgconfig"
+        PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:$(brew --prefix libssh2)/lib/pkgconfig"
+        PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:$(brew --prefix c-ares)/lib/pkgconfig"
+        PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:$(brew --prefix sqlite3)/lib/pkgconfig"
+        echo "PKG_CONFIG_PATH=${PKG_CONFIG_PATH}" >> $GITHUB_ENV
+
+    - name: Generate configure
+      run: autoreconf -i
+
+    - name: Configure
+      run: |
+        ./configure \
+          --without-gnutls \
+          --without-openssl \
+          --with-appletls \
+          --with-libssh2 \
+          --with-sqlite3 \
+          --with-ca-bundle=/etc/ssl/cert.pem \
+          --disable-nls \
+          ARIA2_STATIC=yes
+
+    - name: Build
+      run: make -j$(sysctl -n hw.ncpu)
+
+    - name: Run tests
+      run: make check
+
+    - name: Strip binary
+      run: strip src/aria2c
+
+    - name: Prepare artifact
+      id: artifact
+      run: |
+        VERSION="${{ steps.version.outputs.version }}"
+        ARTIFACT_NAME="aria2-${VERSION}-macos-${{ matrix.arch }}"
+        ARTIFACT_DIR="${ARTIFACT_NAME}"
+        mkdir -p "${ARTIFACT_DIR}"
+        cp src/aria2c "${ARTIFACT_DIR}/"
+        cp COPYING "${ARTIFACT_DIR}/"
+        cp README.rst "${ARTIFACT_DIR}/README"
+        zip -r "${ARTIFACT_NAME}.zip" "${ARTIFACT_DIR}"
+        echo "artifact_name=${ARTIFACT_NAME}" >> $GITHUB_OUTPUT
+        echo "artifact_path=${ARTIFACT_NAME}.zip" >> $GITHUB_OUTPUT
+        file "${ARTIFACT_DIR}/aria2c"
+        "${ARTIFACT_DIR}/aria2c" --version | head -20
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ steps.artifact.outputs.artifact_name }}
+        path: ${{ steps.artifact.outputs.artifact_path }}
+
+    - name: Upload to release
+      if: github.event_name == 'push' && github.ref_type == 'tag'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        gh release upload "${{ github.ref_name }}" "${{ steps.artifact.outputs.artifact_path }}" --clobber
