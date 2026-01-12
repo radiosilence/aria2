@@ -21,7 +21,7 @@ jobs:
         include:
           - os: macos-14
             arch: arm64
-          - os: macos-13-large
+          - os: macos-15
             arch: amd64
 
     runs-on: ${{ matrix.os }}
