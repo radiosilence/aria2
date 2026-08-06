@@ -1,0 +1,192 @@
+name: CI/CD
+
+# Upstream aria2 ships only Android, Windows and source assets, so there is no
+# macOS binary for mise (`github:radiosilence/aria2`) to install. This builds
+# upstream and publishes one here.
+#
+# Upstream is checked out directly rather than merged into this fork: nothing
+# is pushed back, so the stock GITHUB_TOKEN suffices and the fork never drifts.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Release even if upstream has not moved"
+        type: boolean
+        default: false
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+
+permissions:
+  contents: write
+
+jobs:
+  # Tracks upstream's tagged releases, not master. master is 42 commits ahead
+  # of release-1.37.0 but they are dependabot bumps, typo fixes and autoconf
+  # warnings — nothing functional. A real version beats a dated master build.
+  check-upstream:
+    name: Check Upstream
+    runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+      tag: ${{ steps.check.outputs.tag }}
+      version: ${{ steps.check.outputs.version }}
+      upstream_tag: ${{ steps.check.outputs.upstream_tag }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: aria2/aria2
+          fetch-depth: 0
+
+      - name: Compare against last release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          UPSTREAM=$(gh release view --repo aria2/aria2 --json tagName -q .tagName)
+          VERSION="${UPSTREAM#release-}"
+          echo "upstream latest: $UPSTREAM ($VERSION)"
+
+          OURS=$(gh release list --limit 1 --json tagName -q '.[0].tagName' 2>/dev/null || echo "")
+          echo "ours: ${OURS:-none}"
+
+          if [ "${{ github.event.inputs.force }}" = "true" ] || [ "v${VERSION}" != "$OURS" ]; then
+            echo "should_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already built v${VERSION} — nothing to do"
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "upstream_tag=${UPSTREAM}" >> "$GITHUB_OUTPUT"
+          echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.arch }}
+    needs: [check-upstream]
+    if: needs.check-upstream.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macos-14/15 are both Apple Silicon; macos-13 is the last x86_64 runner.
+          - os: macos-14
+            arch: arm64
+          - os: macos-13
+            arch: x86_64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: aria2/aria2
+          ref: ${{ needs.check-upstream.outputs.upstream_tag }}
+
+      - name: Install dependencies
+        run: |
+          brew install \
+            cppunit gettext openssl@3 libssh2 c-ares sqlite3 \
+            autoconf automake pkg-config libtool
+
+      - name: Setup environment
+        run: |
+          echo 'CC=clang' >> $GITHUB_ENV
+          echo 'CXX=clang++' >> $GITHUB_ENV
+          echo "$(brew --prefix gettext)/bin" >> $GITHUB_PATH
+          P="$(brew --prefix openssl@3)/lib/pkgconfig"
+          P="$P:$(brew --prefix libssh2)/lib/pkgconfig"
+          P="$P:$(brew --prefix c-ares)/lib/pkgconfig"
+          P="$P:$(brew --prefix sqlite3)/lib/pkgconfig"
+          echo "PKG_CONFIG_PATH=$P" >> $GITHUB_ENV
+
+      - name: Generate configure
+        run: autoreconf -i
+
+      # ARIA2_STATIC pulls the third-party deps in as archives. macOS has no
+      # static libSystem, so the result still links system libraries — but
+      # nothing from Homebrew, which is the part that breaks on other machines.
+      - name: Configure
+        run: |
+          ./configure \
+            --enable-libaria2 \
+            --with-openssl \
+            --with-libssh2 \
+            --with-sqlite3 \
+            --with-libcares \
+            --without-gnutls \
+            --without-libnettle \
+            --without-libgmp \
+            --without-libgcrypt \
+            ARIA2_STATIC=yes
+
+      - name: Build
+        run: make -j$(sysctl -n hw.ncpu)
+
+      - name: Test
+        run: make check
+
+      - name: Strip
+        run: strip src/aria2c
+
+      # A binary that links a Homebrew dylib works here and nowhere else, so
+      # fail the build rather than ship it. Same for a mislabelled arch.
+      - name: Verify
+        run: |
+          file src/aria2c
+          otool -L src/aria2c
+          if otool -L src/aria2c | grep -qE "/opt/homebrew/|/usr/local/(opt|Cellar)/"; then
+            echo "::error::binary links Homebrew dylibs — static linking did not take"
+            exit 1
+          fi
+          case "${{ matrix.arch }}" in
+            arm64)  file src/aria2c | grep -q arm64  || { echo "::error::expected arm64";  exit 1; } ;;
+            x86_64) file src/aria2c | grep -q x86_64 || { echo "::error::expected x86_64"; exit 1; } ;;
+          esac
+          ./src/aria2c --version | head -3
+
+      - name: Package
+        id: pkg
+        run: |
+          NAME="aria2-${{ needs.check-upstream.outputs.version }}-macos-${{ matrix.arch }}"
+          mkdir -p "$NAME"
+          cp src/aria2c COPYING "$NAME/"
+          tar -czf "${NAME}.tar.gz" "$NAME"
+          echo "path=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aria2-${{ matrix.arch }}
+          path: ${{ steps.pkg.outputs.path }}
+
+  release:
+    name: Release
+    needs: [check-upstream, build]
+    if: needs.check-upstream.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.tag }}
+          name: ${{ needs.check-upstream.outputs.tag }}
+          files: dist/*.tar.gz
+          body: |
+            Statically-linked macOS build of upstream [aria2/aria2](https://github.com/aria2/aria2).
+
+            Built from upstream `${{ needs.check-upstream.outputs.upstream_tag }}`.
+
+            Third-party dependencies are linked in; only macOS system libraries
+            remain dynamic. No Homebrew required at runtime.
+
+            ```
+            mise use -g github:${{ github.repository }}
+            ```
