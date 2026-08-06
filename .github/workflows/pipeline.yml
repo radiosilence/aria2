@@ -21,7 +21,9 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/master' }}
+  # A stuck job must not wedge every later run — macos-13 sat queued for 13h
+  # and blocked two subsequent pushes. Newest commit always wins.
+  cancel-in-progress: true
 
 permissions:
   contents: write
@@ -72,15 +74,18 @@ jobs:
     needs: [check-upstream]
     if: needs.check-upstream.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
         include:
-          # macos-14/15 are both Apple Silicon; macos-13 is the last x86_64 runner.
+          # arm64 only. macos-13 is the last Intel runner and is being retired —
+          # jobs sat queued for 13h and never started. Cross-compiling is not a
+          # way out either: Homebrew on an arm64 runner ships arm64-only
+          # archives, so an x86_64 link has nothing to link against short of
+          # building every dependency from source.
           - os: macos-14
             arch: arm64
-          - os: macos-13
-            arch: x86_64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
