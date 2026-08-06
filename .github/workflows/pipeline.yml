@@ -67,8 +67,8 @@ jobs:
           echo "upstream_tag=${UPSTREAM}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
-  build:
-    name: Build ${{ matrix.arch }}
+  build-macos:
+    name: Build macOS ${{ matrix.arch }}
     needs: [check-upstream]
     if: needs.check-upstream.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
@@ -160,12 +160,95 @@ jobs:
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: aria2-${{ matrix.arch }}
+          name: aria2-macos-${{ matrix.arch }}
+          path: ${{ steps.pkg.outputs.path }}
+
+
+  # Linux gets a genuinely static binary — unlike macOS, which has no static
+  # libSystem. The usual glibc blocker (getaddrinfo needs NSS at runtime) does
+  # not apply because aria2 is built --with-libcares, so DNS never touches NSS.
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    needs: [check-upstream]
+    if: needs.check-upstream.outputs.should_release == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            arch: x86_64
+          - os: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          repository: aria2/aria2
+          ref: ${{ needs.check-upstream.outputs.upstream_tag }}
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential autoconf automake libtool pkg-config gettext \
+            libcppunit-dev libssl-dev libssh2-1-dev libc-ares-dev \
+            libsqlite3-dev libxml2-dev zlib1g-dev
+
+      - name: Generate configure
+        run: autoreconf -i
+
+      - name: Configure
+        run: |
+          ./configure \
+            --enable-libaria2 \
+            --with-openssl \
+            --with-libssh2 \
+            --with-sqlite3 \
+            --with-libcares \
+            --without-gnutls \
+            --without-libnettle \
+            --without-libgmp \
+            --without-libgcrypt \
+            ARIA2_STATIC=yes \
+            LDFLAGS="-static"
+
+      - name: Build
+        run: make -j$(nproc)
+
+      - name: Test
+        run: make check
+
+      - name: Strip
+        run: strip src/aria2c
+
+      # `ldd` printing "not a dynamic executable" is the whole point here.
+      - name: Verify
+        run: |
+          file src/aria2c
+          if ldd src/aria2c 2>&1 | grep -qv "not a dynamic executable"; then
+            echo "::error::binary is not fully static"
+            ldd src/aria2c || true
+            exit 1
+          fi
+          ./src/aria2c --version | head -3
+
+      - name: Package
+        id: pkg
+        run: |
+          NAME="aria2-${{ needs.check-upstream.outputs.version }}-linux-${{ matrix.arch }}"
+          mkdir -p "$NAME"
+          cp src/aria2c COPYING "$NAME/"
+          tar -czf "${NAME}.tar.gz" "$NAME"
+          echo "path=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: aria2-linux-${{ matrix.arch }}
           path: ${{ steps.pkg.outputs.path }}
 
   release:
     name: Release
-    needs: [check-upstream, build]
+    needs: [check-upstream, build-macos, build-linux]
     if: needs.check-upstream.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     steps:
@@ -180,12 +263,13 @@ jobs:
           name: ${{ needs.check-upstream.outputs.tag }}
           files: dist/*.tar.gz
           body: |
-            Statically-linked macOS build of upstream [aria2/aria2](https://github.com/aria2/aria2).
+            Statically-linked macOS and Linux builds of upstream [aria2/aria2](https://github.com/aria2/aria2).
 
             Built from upstream `${{ needs.check-upstream.outputs.upstream_tag }}`.
 
-            Third-party dependencies are linked in; only macOS system libraries
-            remain dynamic. No Homebrew required at runtime.
+            Linux binaries are fully static. macOS has no static libSystem, so
+            system libraries remain dynamic there — but nothing from Homebrew
+            does, which is the part that breaks on other machines.
 
             ```
             mise use -g github:${{ github.repository }}
