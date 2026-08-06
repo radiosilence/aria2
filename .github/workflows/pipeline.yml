@@ -112,15 +112,19 @@ jobs:
       # directory and there is no -static equivalent. So the archives are named
       # explicitly. --disable-nls drops libintl rather than statically linking
       # gettext for translations a CLI downloader does not need.
+      # Darwin's ld prefers a .dylib over a .a in the same directory and has no
+      # -static, so LIBS/-all-static achieve nothing. Staging the archives in a
+      # directory that contains no dylibs means -lssl can only resolve to the
+      # archive. Whatever still links dynamically is reported, not fatal:
+      # macOS keeps every feature and documents its requirements instead.
       - name: Configure
         run: |
-          A=""
+          mkdir -p "$RUNNER_TEMP/staticlibs"
           for p in openssl@3 libssh2 c-ares sqlite; do
-            for f in "$(brew --prefix $p)"/lib/*.a; do A="$A $f"; done
+            cp "$(brew --prefix $p)"/lib/*.a "$RUNNER_TEMP/staticlibs/" 2>/dev/null || true
           done
-          echo "static archives:$A"
+          ls "$RUNNER_TEMP/staticlibs"
           ./configure \
-            --disable-nls \
             --enable-libaria2 \
             --with-openssl \
             --with-libssh2 \
@@ -131,7 +135,7 @@ jobs:
             --without-libgmp \
             --without-libgcrypt \
             ARIA2_STATIC=yes \
-            LIBS="$A"
+            LDFLAGS="-L$RUNNER_TEMP/staticlibs"
 
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
@@ -142,16 +146,26 @@ jobs:
       - name: Strip
         run: strip src/aria2c
 
-      # A binary that links a Homebrew dylib works here and nowhere else, so
-      # fail the build rather than ship it. Same for a mislabelled arch.
+      # Any Homebrew dylib that survives becomes a documented runtime
+      # requirement rather than a build failure — a primo macOS build keeps
+      # every feature, and says what it needs.
       - name: Verify
+        id: verify
         run: |
           file src/aria2c
           otool -L src/aria2c
-          if otool -L src/aria2c | grep -qE "/opt/homebrew/|/usr/local/(opt|Cellar)/"; then
-            echo "::error::binary links Homebrew dylibs — static linking did not take"
-            exit 1
+          ./src/aria2c --version | sed -n "s/^Enabled Features: /features: /p"
+
+          # Map surviving dylibs back to the formula that owns them.
+          FORMULAE=$(otool -L src/aria2c \
+            | grep -oE "/(opt/homebrew|usr/local)/opt/[^/]+" \
+            | sed "s|.*/opt/||" | sort -u | tr "\n" " ")
+          if [ -n "$FORMULAE" ]; then
+            echo "::warning::runtime requires: brew install $FORMULAE"
+          else
+            echo "no Homebrew runtime dependencies"
           fi
+          echo "brew_deps=${FORMULAE}" >> "$GITHUB_OUTPUT"
           case "${{ matrix.arch }}" in
             arm64)  file src/aria2c | grep -q arm64  || { echo "::error::expected arm64";  exit 1; } ;;
             x86_64) file src/aria2c | grep -q x86_64 || { echo "::error::expected x86_64"; exit 1; } ;;
@@ -164,6 +178,22 @@ jobs:
           NAME="aria2-${{ needs.check-upstream.outputs.version }}-macos-${{ matrix.arch }}"
           mkdir -p "$NAME"
           cp src/aria2c COPYING "$NAME/"
+          # Ship the requirements with the binary rather than only in release
+          # notes, so the tarball answers the question on its own.
+          {
+            echo "aria2c ${{ needs.check-upstream.outputs.version }} — macOS ${{ matrix.arch }}"
+            echo
+            ./src/aria2c --version | sed -n "s/^Enabled Features: /features: /p"
+            ./src/aria2c --version | sed -n "s/^Libraries: /libraries: /p"
+            echo
+            if [ -n "${{ steps.verify.outputs.brew_deps }}" ]; then
+              echo "runtime requires:"
+              echo "  brew install ${{ steps.verify.outputs.brew_deps }}"
+            else
+              echo "no Homebrew runtime dependencies — system libraries only"
+            fi
+          } > "$NAME/REQUIREMENTS"
+          cat "$NAME/REQUIREMENTS"
           tar -czf "${NAME}.tar.gz" "$NAME"
           echo "path=${NAME}.tar.gz" >> "$GITHUB_OUTPUT"
 
@@ -276,9 +306,13 @@ jobs:
 
             Built from upstream `${{ needs.check-upstream.outputs.upstream_tag }}`.
 
-            Linux binaries are fully static. macOS has no static libSystem, so
-            system libraries remain dynamic there — but nothing from Homebrew
-            does, which is the part that breaks on other machines.
+            **Linux binaries are fully static** — no glibc dependency, so the same
+            binary runs on Debian, Rocky, Ubuntu 24, Ubuntu 26 and anything else.
+            That matters because there is no shared baseline across distros.
+
+            macOS builds keep every feature (SFTP, Async DNS, BitTorrent, Metalink)
+            and link what they can statically. Anything still dynamic is listed in
+            the `REQUIREMENTS` file inside each macOS tarball.
 
             ```
             mise use -g github:${{ github.repository }}
