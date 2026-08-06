@@ -79,13 +79,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # arm64 only. macos-13 is the last Intel runner and is being retired —
-          # jobs sat queued for 13h and never started. Cross-compiling is not a
-          # way out either: Homebrew on an arm64 runner ships arm64-only
-          # archives, so an x86_64 link has nothing to link against short of
-          # building every dependency from source.
+          # macos-13 is the last Intel runner. A job on it once sat queued for
+          # 13h, but that coincided with a major Actions outage, so runner
+          # scarcity was never actually established. fail-fast is off and the
+          # job has a timeout, so if it does stall it fails on its own rather
+          # than holding up arm64 or the Linux legs.
           - os: macos-14
             arch: arm64
+          - os: macos-13
+            arch: x86_64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
         with:
@@ -216,6 +218,7 @@ jobs:
     needs: [check-upstream]
     if: needs.check-upstream.outputs.should_release == 'true'
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -293,7 +296,13 @@ jobs:
   release:
     name: Release
     needs: [check-upstream, build-macos, build-linux]
-    if: needs.check-upstream.outputs.should_release == 'true'
+    # Linux is the reason this exists — a distro-independent static binary — so
+    # it gates the release. macOS is best-effort: if macos-13 stalls again the
+    # Linux artefacts still ship rather than being held hostage to it.
+    if: >-
+      always()
+      && needs.check-upstream.outputs.should_release == 'true'
+      && needs.build-linux.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
