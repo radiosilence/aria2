@@ -107,12 +107,20 @@ jobs:
       - name: Generate configure
         run: autoreconf -i
 
-      # ARIA2_STATIC pulls the third-party deps in as archives. macOS has no
-      # static libSystem, so the result still links system libraries — but
-      # nothing from Homebrew, which is the part that breaks on other machines.
+      # ARIA2_STATIC sets pkg-config --static and libtool -all-static, neither of
+      # which forces static on Darwin: ld prefers a .dylib over a .a in the same
+      # directory and there is no -static equivalent. So the archives are named
+      # explicitly. --disable-nls drops libintl rather than statically linking
+      # gettext for translations a CLI downloader does not need.
       - name: Configure
         run: |
+          A=""
+          for p in openssl@3 libssh2 c-ares sqlite; do
+            for f in "$(brew --prefix $p)"/lib/*.a; do A="$A $f"; done
+          done
+          echo "static archives:$A"
           ./configure \
+            --disable-nls \
             --enable-libaria2 \
             --with-openssl \
             --with-libssh2 \
@@ -122,7 +130,8 @@ jobs:
             --without-libnettle \
             --without-libgmp \
             --without-libgcrypt \
-            ARIA2_STATIC=yes
+            ARIA2_STATIC=yes \
+            LIBS="$A"
 
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
@@ -190,7 +199,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential autoconf automake libtool pkg-config gettext \
+            build-essential autoconf automake libtool pkg-config gettext autopoint \
             libcppunit-dev libssl-dev libssh2-1-dev libc-ares-dev \
             libsqlite3-dev libxml2-dev zlib1g-dev
 
