@@ -79,14 +79,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # macos-13 is the last Intel runner. A job on it once sat queued for
-          # 13h, but that coincided with a major Actions outage, so runner
-          # scarcity was never actually established. fail-fast is off and the
-          # job has a timeout, so if it does stall it fails on its own rather
-          # than holding up arm64 or the Linux legs.
-          - os: macos-14
+          # Intel macOS is `macos-15-intel`; the old `macos-13` label was
+          # retired. A job requesting a label no runner provides does not
+          # fail — it queues forever (4h40m before it was killed by hand),
+          # and `timeout-minutes` cannot save it because that clock only
+          # starts once a runner picks the job up. Both legs pin the same
+          # OS version so the two architectures share an SDK.
+          - os: macos-15
             arch: arm64
-          - os: macos-13
+          - os: macos-15-intel
             arch: x86_64
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
@@ -244,8 +245,19 @@ jobs:
       - name: Generate configure
         run: autoreconf -i
 
+      # libc-ares-dev builds with CMake and installs its archive as
+      # libcares_static.a, so the -lcares that pkg-config emits resolves only
+      # to libcares.so — which `-static` refuses. Every other dependency ships
+      # a conventionally-named archive; c-ares is the sole exception, and it
+      # cannot be dropped (see the note above about NSS).
       - name: Configure
         run: |
+          mkdir -p "$RUNNER_TEMP/staticlibs"
+          CARES_A=$(find /usr/lib -name 'libcares.a' -o -name 'libcares_static.a' \
+            | head -1)
+          [ -n "$CARES_A" ] || { echo "::error::no c-ares archive found"; exit 1; }
+          ln -sf "$CARES_A" "$RUNNER_TEMP/staticlibs/libcares.a"
+
           ./configure \
             --enable-libaria2 \
             --with-openssl \
@@ -257,7 +269,7 @@ jobs:
             --without-libgmp \
             --without-libgcrypt \
             ARIA2_STATIC=yes \
-            LDFLAGS="-static"
+            LDFLAGS="-static -L$RUNNER_TEMP/staticlibs"
 
       - name: Build
         run: make -j$(nproc)
@@ -269,6 +281,13 @@ jobs:
         run: strip src/aria2c
 
       # `ldd` printing "not a dynamic executable" is the whole point here.
+      #
+      # The download is not a formality. Static glibc resolves names through
+      # NSS, which is dlopen'd and therefore absent from a static binary; the
+      # only reason this works is that c-ares bypasses NSS entirely. If a
+      # future change drops c-ares the binary still builds, still links
+      # statically and still reports a version — it just cannot resolve a
+      # hostname. Nothing short of an actual lookup catches that.
       - name: Verify
         run: |
           file src/aria2c
@@ -278,6 +297,11 @@ jobs:
             exit 1
           fi
           ./src/aria2c --version | head -3
+          ./src/aria2c --version | grep -q "Async DNS" \
+            || { echo "::error::Async DNS missing — DNS would break at runtime"; exit 1; }
+          ./src/aria2c --dir="$RUNNER_TEMP" --out=dns-check \
+            https://github.com/aria2/aria2/raw/master/COPYING \
+            || { echo "::error::static binary cannot resolve hostnames"; exit 1; }
 
       - name: Package
         id: pkg
