@@ -21,8 +21,8 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  # A stuck job must not wedge every later run — macos-13 sat queued for 13h
-  # and blocked two subsequent pushes. Newest commit always wins.
+  # A job that never gets a runner must not wedge every later run — one sat
+  # queued for hours and blocked two subsequent pushes. Newest commit wins.
   cancel-in-progress: true
 
 permissions:
@@ -148,8 +148,17 @@ jobs:
       - name: Build
         run: make -j$(sysctl -n hw.ncpu)
 
+      # automake's harness swallows the test output into a .log file, so a
+      # bare failure says only "FAIL: aria2c". Print it or debugging means
+      # another full CI round trip.
       - name: Test
-        run: make check
+        run: |
+          make check || {
+            for f in test/test-suite.log test/aria2c.log; do
+              if [ -f "$f" ]; then echo "=== $f ==="; cat "$f"; fi
+            done
+            exit 1
+          }
 
       - name: Strip
         run: strip src/aria2c
@@ -274,8 +283,17 @@ jobs:
       - name: Build
         run: make -j$(nproc)
 
+      # automake's harness swallows the test output into a .log file, so a
+      # bare failure says only "FAIL: aria2c". Print it or debugging means
+      # another full CI round trip.
       - name: Test
-        run: make check
+        run: |
+          make check || {
+            for f in test/test-suite.log test/aria2c.log; do
+              if [ -f "$f" ]; then echo "=== $f ==="; cat "$f"; fi
+            done
+            exit 1
+          }
 
       - name: Strip
         run: strip src/aria2c
